@@ -1,31 +1,10 @@
-# Scala/sbt mit sbt-native-packager (kein Dockerfile). Build-Stack ist auf
-# Apache Pekko migriert (statt Akka BSL) - keine repo.akka.io-Auth noetig,
-# Dependencies kommen aus Maven Central.
-#
-# Build-Flow:
-#   1. setup-java (Temurin 17, matched dockerBaseImage in build.sbt)
-#   2. setup-sbt
-#   3. GHCR-Login (nur push-events, PRs duerfen nicht pushen)
-#   4. PR-Event:    sbt 'set dockerUsername := Some("eegfaktura")' Docker/publishLocal
-#      Push-Event:  sbt 'set dockerUsername := Some("eegfaktura")' Docker/publish
-#        - Override: build.sbt hat `dockerUsername := Some("vfeeg-development")`,
-#          aber GITHUB_TOKEN dieses Repos darf nur in `eegfaktura/*` pushen.
-#        - dockerAliases (build.sbt:55-63) pusht zusaetzlich :latest +
-#          :<dockerVersion>-Tag in den eegfaktura-Namespace.
-#
-# Image-Pfad: ghcr.io/eegfaktura/eeg-registration-backend (Legacy-Name aus
-# build.sbt:40 `packageName` beibehalten, damit kein Source-Code-Eingriff
-# noetig ist).
-#
-# Voll-Pipeline Stufe 3: Build + Push + dispatch-deploy zum Platform-Repo.
-#
-# Vorbedingungen:
-#   - GITHUB_TOKEN (automatisch verfuegbar) — fuer GHCR-Push
-#   - PLATFORM_DEPLOY_PAT-Secret im Source-Repo — fuer Cross-Repo-Dispatch
-#     (Fine-grained Token 'eegfaktura-platform-dispatch')
-#   - Mapping `deploy-admin-backend` in Platform-Workflow deploy-on-dispatch.yml (vorhanden)
-#   - K8s-Manifest k8s/32-admin-backend.yaml zeigt auf
-#     ghcr.io/eegfaktura/eeg-registration-backend:latest (vorhanden)
+# gemeinstrom-Fork-Variante des upstream rolling-release-Workflows.
+# Delta zum Upstream (eegfaktura/eegfaktura-admin-backend):
+#   - Login mit GITHUB_TOKEN statt VFEEG_DEV_PUSH_PAT (same-org push)
+#   - dispatch-deploy Jobs entfernt (kein Deploy-Dispatch in fremde Orgs)
+#   - build.sbt separat: dockerUsername/DockerAlias "gemeinstrom",
+#     packageName "eegfaktura-admin-backend" -> ghcr.io/gemeinstrom/eegfaktura-admin-backend
+# Aufgesetzt 2026-10-04 (Fork-Neuanlage admin-backend).
 
 name: Docker Image CI (sbt-native-packager)
 
@@ -76,114 +55,18 @@ jobs:
             sbt-${{ runner.os }}-
 
       - name: Login to Container Registry
-        # Push cross-org nach vfeeg-development/* (Development-Tier, ADR-0005).
-        # GITHUB_TOKEN ist auf eegfaktura/* beschraenkt — daher der Classic-PAT
-        # VFEEG_DEV_PUSH_PAT (write:packages auf vfeeg-development).
-        # PR-Builds duerfen nicht pushen — Login-Step nur bei push.
+        # Same-Org push nach ghcr.io/gemeinstrom/* — GITHUB_TOKEN reicht.
         if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.VFEEG_DEV_PUSH_PAT }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build (PR via Docker/publishLocal) / Build+Push (push via Docker/publish)
         run: |
-          # Kein dockerUsername-Override mehr: build.sbt setzt bereits
-          # dockerUsername := Some("vfeeg-development") und die dockerAliases
-          # pushen eeg-registration-backend ebenfalls nach vfeeg-development.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             sbt Docker/publishLocal
           else
             sbt Docker/publish
           fi
-
-  # Triggert das Platform-Repo, damit es den Cluster aktualisiert.
-  # Laeuft nur bei push to default-branch (master/main), nicht bei PRs oder Tags.
-  # Vorbedingung: PLATFORM_DEPLOY_PAT-Secret muss im Source-Repo gesetzt sein
-  # (Fine-grained PAT 'eegfaktura-platform-dispatch' mit Repository-Dispatch-Write
-  # auf vfeeg-development/eegfaktura-platform).
-  dispatch-deploy:
-    needs: build-and-push-image
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger deploy in platform repo
-        env:
-          GH_TOKEN: ${{ secrets.PLATFORM_DEPLOY_PAT }}
-        run: |
-          PAYLOAD=$(cat <<EOF
-          {
-            "event_type": "deploy-admin-backend",
-            "client_payload": {
-              "image_tag": "latest",
-              "source_sha": "${GITHUB_SHA}",
-              "source_repo": "${GITHUB_REPOSITORY}",
-              "source_ref": "${GITHUB_REF}"
-            }
-          }
-          EOF
-          )
-          echo "$PAYLOAD" | gh api repos/vfeeg-development/eegfaktura-platform/dispatches --input -
-          echo "Dispatched deploy-admin-backend for sha=${GITHUB_SHA:0:8}"
-
-  # Preview-Deploy (ADR-0007): Push auf preview/** -> pinned Deploy des sha-Builds
-  # in die Dev-Zone, ohne main/Release anzufassen. Nur auf preview/**-Branches.
-  dispatch-preview-deploy:
-    needs: build-and-push-image
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/preview/')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger pinned preview deploy in platform repo
-        env:
-          GH_TOKEN: ${{ secrets.PLATFORM_DEPLOY_PAT }}
-        run: |
-          PAYLOAD=$(cat <<EOF
-          {
-            "event_type": "deploy-admin-backend",
-            "client_payload": {
-              "mode": "pinned",
-              "image_tag": "sha-${GITHUB_SHA:0:7}",
-              "source_sha": "${GITHUB_SHA}",
-              "source_repo": "${GITHUB_REPOSITORY}",
-              "source_ref": "${GITHUB_REF}"
-            }
-          }
-          EOF
-          )
-          echo "$PAYLOAD" | gh api repos/vfeeg-development/eegfaktura-platform/dispatches --input -
-          echo "Dispatched pinned preview deploy-admin-backend for sha-${GITHUB_SHA:0:7}"
-
-  # Feature-Env-Deploy (ADR-0008): Push auf env/<name> -> pinned Deploy des sha-Builds
-  # in den Namespace env-<name>. Die Env muss bereits provisioniert sein
-  # (overlays/env/<name> im platform-Repo); dieser Job deployt nur hinein.
-  dispatch-env-deploy:
-    needs: build-and-push-image
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/env/')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger pinned env deploy in platform repo
-        env:
-          GH_TOKEN: ${{ secrets.PLATFORM_DEPLOY_PAT }}
-        run: |
-          set -eu
-          ENV_NAME="${GITHUB_REF#refs/heads/env/}"
-          case "$ENV_NAME" in
-            *[!a-z0-9-]*|-*|*-|"") echo "Ungueltiger Env-Name aus '$GITHUB_REF' — erlaubt: a-z, 0-9, '-'" >&2; exit 1 ;;
-          esac
-          PAYLOAD=$(cat <<EOF
-          {
-            "event_type": "deploy-admin-backend",
-            "client_payload": {
-              "mode": "pinned",
-              "env": "${ENV_NAME}",
-              "image_tag": "sha-${GITHUB_SHA:0:7}",
-              "source_sha": "${GITHUB_SHA}",
-              "source_repo": "${GITHUB_REPOSITORY}",
-              "source_ref": "${GITHUB_REF}"
-            }
-          }
-          EOF
-          )
-          echo "$PAYLOAD" | gh api repos/vfeeg-development/eegfaktura-platform/dispatches --input -
-          echo "Dispatched pinned env deploy-admin-backend for sha-${GITHUB_SHA:0:7} -> env-${ENV_NAME}"

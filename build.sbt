@@ -37,14 +37,14 @@ lazy val root = (project in file("."))
   )
 
 lazy val dockerSettings = Seq(
-//  Docker / packageName := "eeg-registration-backend",
+//  Docker / packageName := "eegfaktura-admin-backend",
 //  Docker / maintainer := "vfeeg <vfeeg.org>",
 //  Docker / version := appVersion,
 
   dockerBaseImage := "eclipse-temurin:17-jre",
   dockerRepository := Some("ghcr.io"),
-  dockerUsername := Some("vfeeg-development"),
-  packageName := "eeg-registration-backend",
+  dockerUsername := Some("gemeinstrom"),
+  packageName := "eegfaktura-admin-backend",
   maintainer := "vfeeg <vfeeg.org>",
   dockerUpdateLatest := !isFeatureBranchBuild,
   dockerExposedVolumes := Seq("/conf"),
@@ -68,14 +68,14 @@ lazy val dockerSettings = Seq(
     // Tag nicht kennt — Preview- und Env-Deploy (ADR-0007/0008) pinnen aber genau darauf und
     // liefen deshalb in ImagePullBackOff. Also selbst erzeugen.
     val shaAlias = sys.env.get("GITHUB_SHA").filter(_.nonEmpty).toSeq.map { sha =>
-      DockerAlias(repo, Some("vfeeg-development"), name, Some("sha-" + sha.take(7)))
+      DockerAlias(repo, Some("gemeinstrom"), name, Some("sha-" + sha.take(7)))
     }
 
     val movingAliases =
       if (isFeatureBranchBuild) Seq.empty
       else Seq(
-        DockerAlias(repo, Some("vfeeg-development"), name, Some(dockerVersion)),
-        DockerAlias(repo, Some("vfeeg-development"), name, Some("latest")),
+        DockerAlias(repo, Some("gemeinstrom"), name, Some(dockerVersion)),
+        DockerAlias(repo, Some("gemeinstrom"), name, Some("latest")),
       )
 
     movingAliases ++ shaAlias
