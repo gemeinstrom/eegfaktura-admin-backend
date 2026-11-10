@@ -1,20 +1,19 @@
 package at.ourproject.services
 
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
-import org.apache.pekko.actor.typed.{ActorRef, ActorSystem, Behavior, Scheduler}
+import org.apache.pekko.actor.typed.{ActorRef, ActorSystem, Behavior, SupervisorStrategy}
 import org.apache.pekko.grpc.GrpcClientSettings
-import org.apache.pekko.util.Timeout
 import at.energydash.admin.{RegisterPontonRequest, RegisterPontonServiceClient}
 import at.ourproject.admin.{AdminEegServiceClient, UpdateEegRequest}
-import at.ourproject.keycloak.KeycloakClient
-import at.ourproject.keycloak.KeycloakClient.User
+import at.ourproject.keycloak.{AccountStatus, KeycloakClient}
+import at.ourproject.keycloak.KeycloakClient.{AccountView, User}
+import at.ourproject.logging.LogContext
 import at.ourproject.register.{RegisterEegRequest, RegisterEegServiceClient}
 import io.circe.{Decoder, Encoder}
 import org.slf4j.{Logger, LoggerFactory}
 
-import scala.concurrent.duration.DurationInt
 import scala.concurrent.{ExecutionContext, Future}
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Success, Try}
 
 object GridAreaType extends Enumeration {
   type GridArea = Value
@@ -22,7 +21,7 @@ object GridAreaType extends Enumeration {
   implicit val decoder: Decoder[Value] = Decoder.decodeEnumeration(this)
   implicit val encoder: Encoder[Value] = Encoder.encodeEnumeration(this)
 
-  val LOCAL, REGIONAL, GEA, BEG = Value
+  val LOCAL, REGIONAL, GEA, BEG, P2P, EVA = Value
 }
 
 object GridAllocationType extends Enumeration {
@@ -69,7 +68,7 @@ object RegisterService {
   import at.ourproject.services.GridAreaType.GridArea
   import at.ourproject.services.PontonCommType.PontonComm
 
-  trait Command
+  trait Command extends LogContext.Carrier
 
   trait ResponseCommand extends Command
 
@@ -87,65 +86,141 @@ object RegisterService {
 
   case class UserInfo(username: String, password: String, firstname: String, lastname: String, email: String)
 
-  case class Eeg(tenant: String, rcNumber: String, communityId: String, name: String, description: String, online: Boolean,
-                 accountInfo: AccountInfo, businessInfo: BusinessInfo, grid: Grid, contact: Contact, pontonInfo: PontonInfo, user: UserInfo)
+  /** A person with access to a community; all accounts have the same rights. */
+  case class AccountUser(firstname: String, lastname: String, email: String)
 
-  case class AuthorizedUser(firstname: String, lastname: String, email: String, tenant: String, roles: Option[List[String]])
+  /** status: created, linked (existing account got the community) or failed (message says why). */
+  case class AccountResult(email: String, status: String, message: String)
+
+  case class Eeg(tenant: String, rcNumber: String, communityId: String, name: String, description: String, online: Boolean,
+                 accountInfo: AccountInfo, businessInfo: BusinessInfo, grid: Grid, contact: Contact, pontonInfo: PontonInfo, user: UserInfo,
+                 accounts: Option[List[AccountUser]] = None)
 
   case class RegisterEeg(eeg: Eeg, groups: List[String], replyTo: ActorRef[Command]) extends Command
 
-  case class EegRegistered(code: Int, message: String) extends ResponseCommand
+  /** accounts: the result per account of the registration's list (empty without a list). */
+  case class EegRegistered(code: Int, message: String, accounts: List[AccountResult] = Nil) extends ResponseCommand
   case class EegRegisterError(code: Int, message: String) extends ResponseCommand
-
-  private case class RegisterParticipant(tenant: String, firstname: String, lastname: String, email: String) extends Command
-
-  case class LookupUsersRequest(tenant: String, replyTo: ActorRef[Command]) extends Command
-
-  case class LookupUsersResponse(users: List[AuthorizedUser]) extends Command
 
   case class AddTenantToUser(tenant: String, user: String, replyTo: ActorRef[Command]) extends Command
   case class AddTenantToUserResponse(status: Int) extends Command
+
+  case class AddAccount(tenant: String, user: AccountUser, groups: List[String], replyTo: ActorRef[Command]) extends Command
+  case class AddAccountResponse(status: Int, result: AccountResult) extends Command
+
+  case class ListAccounts(tenant: String, replyTo: ActorRef[Command]) extends Command
+  case class ListAccountsResponse(status: Int, accounts: List[AccountView], message: String = "") extends Command
 
   case class PontonRegister(tenant: String, rcNumber: String, pontonInfo: PontonInfo, replyTo: ActorRef[Command]) extends Command
   case class PontonRegisterResponse(status: Int, message: String) extends Command
 
   val log: Logger = LoggerFactory.getLogger(getClass)
 
+  /** Ponton is registered with KEP only; the mail transport is no longer used. */
+  val KepCommType: String = PontonCommType.KEP.toString
+  val MailNotSupported: String = "MAIL-Transport wird nicht mehr unterstützt"
+  val NoPontonSelected: String = "Keine Ponton-Anbindung gewählt"
+
+  /** RegisteredEegReply.status of the backend: the tenant exists, nothing was written (261015-ca1). */
+  val EegExistsStatus: Int = 409
+  def eegAlreadyRegistered(tenant: String, rcNumber: String): String =
+    s"EEG ist bereits registriert (Tenant ${tenant.toUpperCase()}, RC-Nummer ${rcNumber.toUpperCase()}). Es wurde nichts geändert; fehlende Logins oder Ponton über „EEG Accounts“ bzw. „Ponton Verbindung“ ergänzen."
+
+  /** New communities are registered with dynamic allocation only (E6, platform#229); existing ones keep theirs. */
+  val StaticAllocationRefused: String = "Neue Gemeinschaften können nur mit dynamischer Aufteilung registriert werden."
+
+  /** The gRPC value of each community type, without a default (never REGIONAL for an unknown type). */
+  val GrpcGridArea: Map[GridArea, RegisterEegRequest.GRID_AREA] = Map(
+    GridAreaType.LOCAL -> RegisterEegRequest.GRID_AREA.LOCAL,
+    GridAreaType.REGIONAL -> RegisterEegRequest.GRID_AREA.REGIONAL,
+    GridAreaType.BEG -> RegisterEegRequest.GRID_AREA.BEG,
+    GridAreaType.GEA -> RegisterEegRequest.GRID_AREA.GEA,
+    GridAreaType.P2P -> RegisterEegRequest.GRID_AREA.P2P,
+    GridAreaType.EVA -> RegisterEegRequest.GRID_AREA.EVA)
+
+  /** Groups of every account of a community: all accounts have the same rights (platform#166). */
+  val AccountGroups: List[String] = List("EEG_ADMIN", "EEG_OWNER")
+
+  private val EmailPattern = "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$".r
+
+  private val TenantPattern = "^[A-Za-z0-9_-]+$".r
+
+  /** A tenant as it goes into the Keycloak attribute: trimmed, only letters, digits, _ and -. */
+  def validTenant(tenant: String): Option[String] = Option(tenant).map(_.trim).filter(t => TenantPattern.findFirstIn(t).isDefined)
+
+  /** Why the account cannot be created, if it cannot. */
+  def invalidAccount(user: AccountUser): Option[String] =
+    if (user.firstname.trim.isEmpty || user.lastname.trim.isEmpty) Some("Vorname und Nachname erforderlich")
+    else if (EmailPattern.findFirstIn(user.email.trim).isEmpty) Some("E-Mail-Adresse ungültig")
+    else None
+
+  def trimmed(user: AccountUser): AccountUser = AccountUser(user.firstname.trim, user.lastname.trim, user.email.trim)
+
+  /** Set up the accounts; a failure becomes a result, not an exception. The groups are read once. */
+  def setupAccounts(keycloakClient: KeycloakClient, tenant: String, users: List[AccountUser], groups: List[String]): List[AccountResult] = {
+    lazy val userGroups = keycloakClient.getGroups.filter(g => groups.contains(g.getName))
+    users.map(user => setupAccount(keycloakClient, tenant, user, userGroups))
+  }
+
+  private def setupAccount(keycloakClient: KeycloakClient, tenant: String, user: AccountUser,
+                           userGroups: => List[org.keycloak.representations.idm.GroupRepresentation]): AccountResult =
+    invalidAccount(user) match {
+      case Some(reason) => AccountResult(user.email, AccountStatus.failed.toString, reason)
+      case None =>
+        val u = trimmed(user)
+        Try(keycloakClient.ensureAccount(tenant, u, userGroups)) match {
+          case Success(status) => AccountResult(u.email, status.toString, "")
+          case Failure(e) =>
+            log.error(s"Setting up an account for tenant ${tenant.toUpperCase()} failed", e)
+            AccountResult(u.email, AccountStatus.failed.toString, e.getMessage)
+        }
+    }
+
+  /** The accounts of a registration without duplicates (e-mail, case-insensitive); None: the old way, a login for the contact. */
+  def registrationAccounts(eeg: Eeg): Option[List[AccountUser]] =
+    eeg.accounts.filter(_.nonEmpty).map(_.foldLeft(List.empty[AccountUser])((acc, a) =>
+      if (acc.exists(_.email.trim.equalsIgnoreCase(a.email.trim))) acc else acc :+ a))
+
   def registerPonton(eeg: Eeg, pontonClient: RegisterPontonServiceClient)(implicit ec: ExecutionContext): Future[Boolean]  = {
     eeg.pontonInfo.pontonCommType match {
       case PontonCommType.NONE => Future(true)
       case _ if eeg.online =>
         pontonClient.register(
-          RegisterPontonRequest(eeg.rcNumber.toUpperCase(), eeg.pontonInfo.username, eeg.pontonInfo.password, eeg.pontonInfo.domain)).map(r => r.status == 200)
+          RegisterPontonRequest(eeg.rcNumber.toUpperCase(), eeg.pontonInfo.username, eeg.pontonInfo.password, eeg.pontonInfo.domain,
+            pontonCommType = KepCommType)).map(r => r.status == 200)
       case _ => Future(true)
     }
   }
 
   def apply(keycloakClient: KeycloakClient): Behavior[Command] = {
-    import scala.jdk.CollectionConverters._
-//    val dbConfig = Db.getConfig
-
     Behaviors.setup[Command] { context =>
       implicit def system: ActorSystem[Nothing] = context.system
 
       implicit def ec: ExecutionContext = system.executionContext
 
-      implicit def scheduler: Scheduler = context.system.scheduler
-
-      implicit lazy val timeout: Timeout = Timeout(15.seconds)
-      //      context.system.receptionist ! Receptionist.Register(NodeServiceKey, context.self)
-
       val adminClient = AdminEegServiceClient(GrpcClientSettings.fromConfig("register.RegisterEegService"))
       val eegClient = RegisterEegServiceClient(GrpcClientSettings.fromConfig("register.RegisterEegService"))
       val pontonClient = RegisterPontonServiceClient(GrpcClientSettings.fromConfig("register.RegisterPontonService"))
 
-//      val userRepo = new SlickTenantUserRepository(dbConfig)
-
-      Behaviors.receiveMessage { message => {
+      // This is the only RegisterService actor: an exception escaping a message
+      // must not stop it. Resume keeps the behaviour and the gRPC clients; the
+      // actor holds no state that a failed message could leave inconsistent.
+      Behaviors.withMdc[Command]((message: Command) => message.logFields)(Behaviors.supervise(Behaviors.receiveMessage[Command] { message => {
         message match {
+          case RegisterEeg(eeg, _, replyTo) if eeg.online && eeg.pontonInfo.pontonCommType == PontonCommType.MAIL =>
+            replyTo ! EegRegisterError(400, MailNotSupported)
+
+          case RegisterEeg(eeg, _, replyTo) if eeg.grid.allocation == GridAllocationType.STATIC =>
+            replyTo ! EegRegisterError(400, StaticAllocationRefused)
+
+          // checked before the community is registered: afterwards it could get no login
+          case RegisterEeg(eeg, _, replyTo) if registrationAccounts(eeg).isDefined && validTenant(eeg.tenant).isEmpty =>
+            replyTo ! EegRegisterError(400, "Tenant ungültig")
+
           case RegisterEeg(eeg, groups, replyTo) => {
-            val userExists = keycloakClient.checkUserAlreadyExist(eeg.user.email)
-            val request = RegisterEegRequest(eeg.tenant, eeg.rcNumber.toUpperCase(), eeg.communityId, eeg.name, eeg.description,
+            lazy val userExists = keycloakClient.checkUserAlreadyExist(eeg.user.email)
+            // the tenant as the accounts get it: spaces around it must not pass the backend's check
+            val request = RegisterEegRequest(validTenant(eeg.tenant).getOrElse(eeg.tenant), eeg.rcNumber.toUpperCase(), eeg.communityId, eeg.name, eeg.description,
               eeg.accountInfo.iban, eeg.accountInfo.owner, eeg.accountInfo.sepa,
               (eeg.businessInfo.legal match {
                 case EegLegalType.verein => RegisterEegRequest.EEG_LEGAL.verein
@@ -159,25 +234,29 @@ object RegisterService {
                 case EegSettlementType.QUARTER => RegisterEegRequest.EEG_SETTELMENT.QUARTER
                 case EegSettlementType.MONTHLY => RegisterEegRequest.EEG_SETTELMENT.MONTHLY
                 case _ => RegisterEegRequest.EEG_SETTELMENT.ANNUAL
-              }), eeg.grid.id, eeg.grid.name, (eeg.grid.area match {
-                case GridAreaType.LOCAL => RegisterEegRequest.GRID_AREA.LOCAL
-                case GridAreaType.BEG => RegisterEegRequest.GRID_AREA.BEG
-                case GridAreaType.GEA => RegisterEegRequest.GRID_AREA.GEA
-                case _ => RegisterEegRequest.GRID_AREA.REGIONAL
-              }), (eeg.grid.allocation match {
-                case GridAllocationType.DYNAMIC => RegisterEegRequest.GRID_ALLOCATION.DYNAMIC
-                case _ => RegisterEegRequest.GRID_ALLOCATION.STATIC
-              }), s"${eeg.user.firstname} ${eeg.user.lastname}", eeg.contact.street, eeg.contact.streetNumber, eeg.contact.city, eeg.contact.zip,
+              }), eeg.grid.id, eeg.grid.name, GrpcGridArea(eeg.grid.area),
+              // STATIC is refused above (E6)
+              RegisterEegRequest.GRID_ALLOCATION.DYNAMIC, s"${eeg.user.firstname} ${eeg.user.lastname}", eeg.contact.street, eeg.contact.streetNumber, eeg.contact.city, eeg.contact.zip,
               eeg.user.email, eeg.contact.web, eeg.contact.phone, eeg.online,
             )
 
-            context.log.info(s"Register new EEG ${request}")
+            context.log.info(s"Register new EEG ${request.rcNumber} (tenant ${request.tenant})")
 
             (for {
-              eegReply <- eegClient.register(request).map(r => r.status == 201)
-              pontonReply <- registerPonton(eeg, pontonClient)
-            } yield (eegReply && pontonReply)).onComplete {
-              case Success(state) if state =>
+              eegStatus <- eegClient.register(request).map(_.status)
+              // Ponton and Keycloak only for a community that was created
+              pontonReply <- if (eegStatus == 201) registerPonton(eeg, pontonClient) else Future.successful(false)
+            } yield (eegStatus, pontonReply)).onComplete {
+              case Success((EegExistsStatus, _)) =>
+                replyTo ! EegRegisterError(EegExistsStatus, eegAlreadyRegistered(request.tenant, eeg.rcNumber))
+              // With a list of accounts (platform#166) exactly these get a login, the contact only if listed.
+              case Success((_, state)) if state && registrationAccounts(eeg).isDefined =>
+                val accounts = registrationAccounts(eeg).get
+                replyTo ! EegRegistered(201, "", validTenant(eeg.tenant) match {
+                  case Some(tenant) => setupAccounts(keycloakClient, tenant, accounts, groups)
+                  case None => accounts.map(a => AccountResult(a.email, AccountStatus.failed.toString, "Tenant ungültig"))
+                })
+              case Success((_, state)) if state =>
                 try {
                   log.info(s"Create Keycloak User [exists=${userExists}} - ${eeg.rcNumber}")
                   if (userExists) {
@@ -199,46 +278,58 @@ object RegisterService {
                   }
                 } catch {
                   case e: Exception =>
-                    log.error(s"Creating/Updating ($userExists) Keycloak User failed ${eeg.rcNumber} - ${e.getMessage}")
+                    // not $userExists: when the check itself failed, reading it here throws again and no reply is sent
+                    log.error(s"Creating/Updating Keycloak User failed ${eeg.rcNumber}", e)
                     replyTo ! EegRegisterError(510, s"Creating Keycloak User failed! ${e.getMessage}")
                 }
               case Failure(e) =>
-                log.error(s"Failure Create User: ${e.toString}")
+                log.error("Failure Create User", e)
                 replyTo ! EegRegisterError(502, s"Creating Tenant failed! ${e.getMessage}")
-              case e =>
-                log.error(s"Error creating EEG ${e.toString}")
+              case Success((status, _)) =>
+                log.error(s"Error creating EEG (backend status $status, no Ponton registration)")
                 replyTo ! EegRegisterError(501, "Creating Tenant failed!")
-            }
+            }(LogContext.inherited(ec))
           }
-
-          case RegisterParticipant(tenant, firstname, lastname, email) =>
-
-//            userRepo.create(KeycloakUser(id = UUID.randomUUID(),
-//              tenant = tenant,
-//              username = None,
-//              firtsname = firstname,
-//              lastname = lastname,
-//              email = email,
-//              invitedAt = LocalDateTime.now(), createdAt = LocalDateTime.now, status = 0))
-
-          case LookupUsersRequest(tenant, replyTo) =>
-            replyTo ! LookupUsersResponse(
-              keycloakClient.findUserByTenant(tenant) match {
-                case Success(l) =>
-                  l.filter(ku => ku.getFirstName != null).map(ku =>
-                    AuthorizedUser(ku.getFirstName, ku.getLastName, ku.getEmail, tenant, if (ku.getRealmRoles == null) None else Some(ku.getRealmRoles.asScala.toList)))
-                case Failure(e) =>
-                  context.log.error(e.getMessage)
-                  List.empty
-              })
 
           case AddTenantToUser(tenant, email, replyTo) =>
             keycloakClient.getUserId(email) match {
               case Success(id) =>
-                keycloakClient.addTenantToUser(id, tenant)
-                replyTo ! AddTenantToUserResponse(200)
+                Try(keycloakClient.addTenantToUser(id, tenant)) match {
+                  case Success(_) => replyTo ! AddTenantToUserResponse(200)
+                  case Failure(e) =>
+                    context.log.error(s"Adding tenant ${tenant.toUpperCase()} to a user failed", e)
+                    replyTo ! AddTenantToUserResponse(500)
+                }
               case _ => replyTo ! AddTenantToUserResponse(500)
             }
+
+          case AddAccount(tenant, user, _, replyTo) if validTenant(tenant).isEmpty =>
+            replyTo ! AddAccountResponse(400, AccountResult(user.email, AccountStatus.failed.toString, "EEG fehlt oder ungültig"))
+
+          case AddAccount(tenant, user, groups, replyTo) =>
+            val result = setupAccounts(keycloakClient, validTenant(tenant).get, List(user), groups).head
+            val status = if (result.status != AccountStatus.failed.toString) 200
+              else if (invalidAccount(user).isDefined) 400
+              else if (KeycloakClient.Refusals.contains(result.message)) 409 else 500
+            replyTo ! AddAccountResponse(status, result)
+
+          case ListAccounts(tenant, replyTo) if validTenant(tenant).isEmpty =>
+            replyTo ! ListAccountsResponse(400, Nil, "EEG fehlt oder ungültig")
+
+          case ListAccounts(tenant, replyTo) =>
+            Try(keycloakClient.listAccounts(validTenant(tenant).get)) match {
+              case Success(accounts) => replyTo ! ListAccountsResponse(200, accounts)
+              case Failure(e) =>
+                log.error(s"Listing the accounts of tenant ${tenant.toUpperCase()} failed", e)
+                replyTo ! ListAccountsResponse(500, Nil, "Accounts konnten nicht geladen werden")
+            }
+
+          case PontonRegister(_, _, pontonInfo, replyTo) if pontonInfo.pontonCommType == PontonCommType.MAIL =>
+            replyTo ! PontonRegisterResponse(400, MailNotSupported)
+
+          // NONE is no communication type for eda-xp: registering it would store "NONE" as type.
+          case PontonRegister(_, _, pontonInfo, replyTo) if pontonInfo.pontonCommType == PontonCommType.NONE =>
+            replyTo ! PontonRegisterResponse(400, NoPontonSelected)
 
           case PontonRegister(tenant, rcNumber, pontonInfo, replyTo) =>
             val pontonRequest = RegisterPontonRequest(rcNumber.toUpperCase(),
@@ -254,7 +345,9 @@ object RegisterService {
                   tenant = tenant,
                   value = Map("online" -> "true"),
                 )) onComplete {
-                  case Success(_) => replyTo ! PontonRegisterResponse(500, value.message)
+                  case Success(update) if update.status == 200 || update.status == 201 =>
+                    replyTo ! PontonRegisterResponse(value.status, value.message)
+                  case Success(update) => replyTo ! PontonRegisterResponse(update.status, update.message)
                   case Failure(ex) => replyTo ! PontonRegisterResponse(500, ex.getMessage)
                 }
               }
@@ -264,7 +357,7 @@ object RegisterService {
         }
         Behaviors.same
       }
-      }
+      }).onFailure[Exception](SupervisorStrategy.resume))
     }
   }
 }
