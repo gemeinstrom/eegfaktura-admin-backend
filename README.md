@@ -2,11 +2,11 @@
 
 > Registration and administration backend for the eegfaktura suite.
 
-Provides the REST and gRPC APIs behind the EEG registration/admin web UI:
-onboarding of renewable energy communities (EEGs) and participants,
-metering-point administration, grid-operator lookup, and administrative updates
-to EEG configuration and process state. Multi-tenant; integrates with Keycloak
-for user and realm management. (Container image: `eeg-registration-backend`.)
+Provides the REST API behind the superuser part of the admin web UI (`eegfaktura-admin`):
+registration of renewable energy communities (EEGs) with their logins (Keycloak accounts) and the Ponton
+connection, and superuser reads and updates of master data (EEGs, participants with their metering points,
+grid operators). It serves HTTP only; it calls `eegfaktura-backend` and `eegfaktura-eda-xp` as a gRPC client.
+(Container image: `eeg-registration-backend`.)
 
 Part of the **eegfaktura** suite — an open-source billing and management platform
 for Austrian renewable energy communities (*Erneuerbare-Energiegemeinschaften*, EEG).
@@ -14,20 +14,20 @@ for Austrian renewable energy communities (*Erneuerbare-Energiegemeinschaften*, 
 ## Tech stack
 
 - **Scala 2.13**, built with **sbt**
-- **Apache Pekko 1.2** — Actors, Pekko HTTP, Pekko gRPC
+- **Apache Pekko 1.2** — Actors, Pekko HTTP, Pekko gRPC (clients)
 - **Slick 3.5** + HikariCP over **PostgreSQL**
-- **Keycloak** admin/OIDC integration; Nimbus JOSE+JWT for token validation
-- Circe (JSON), sttp client, Logback
+- **Keycloak** admin client (accounts); Nimbus JOSE+JWT for token validation
+- Circe (JSON), Logback
 - Packaged via sbt-native-packager (base image `eclipse-temurin:17-jre`)
 
 ## Key components
 
 - `src/main/scala/at/ourproject/`
-  - `routes/` — HTTP routes (Admin, Eeg, Registration) + Keycloak JWT authenticator
+  - `routes/` — HTTP routes (Admin, Eeg, Registration, Health) + Keycloak JWT authenticator
   - `services/` — actor-based business logic (`RegisterService`, `AdminService`)
-  - `dao/` — repositories (EEG, participants, operators, metering, tenant users)
-  - `keycloak/` — Keycloak admin & OAuth2 client integration
-- `src/main/protobuf/` — gRPC contracts (`register.proto`, `master.proto`, `ponton.proto`)
+  - `dao/` — read repositories (EEG, participants, operators, metering points)
+  - `keycloak/` — Keycloak admin client (accounts of a community)
+- `src/main/protobuf/` — gRPC contracts of the called services (`register.proto`, `master.proto`, `ponton.proto`)
 - Entry point: `Registration.scala` (binds HTTP on `:8085`)
 
 ## Build
@@ -65,7 +65,19 @@ Environment variables (names only — never commit secret values):
 | `REGISTER_SERVICE_HOST_EEG` | gRPC host of `eegfaktura-backend` (EEG registration) |
 | `REGISTER_SERVICE_HOST_PONTON` | gRPC host of `eegfaktura-eda-xp` (Ponton/KEP registration) |
 | `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_DBNAME`, `DATABASE_USER`, `DATABASE_PASSWORD` | PostgreSQL connection |
-| `LOG_LEVEL` | log level |
+| `LOG_LEVEL` | root log level, also for Pekko: `trace`, `debug`, `info`, `warn` (or `warning`), `error` (default `info`); empty counts as unset, an unknown value stops the start |
+| `LOG_LEVEL_HTTP_CLIENT` | log level of the Keycloak admin client's HTTP stack (`org.apache.http`, `org.jboss.resteasy`; default `warn`, does not follow `LOG_LEVEL`); its raw traffic and headers are always off |
+| `LOG_LEVEL_APP` | log level of the application loggers `at.ourproject.*` (default: `LOG_LEVEL`); `debug` only for troubleshooting |
+| `LOG_FORMAT` | `json` (one ECS JSON object per line, default) or `text` (readable line, e.g. locally) |
+| `DEPLOYMENT_ENVIRONMENT` | `deployment.environment` on every log line (`local`, `dev`, `pilot`, `prod`); unset or empty: the field is left out |
+| `SERVICE_VERSION` | `service.version` in the log lines; set by the image build: `sha-<short>` of the built commit (the git tag on a tag build), otherwise `dev`; a promoted release (re-tag as `vX.Y.Z`, no rebuild) keeps the `sha-<short>` |
+
+Every log line goes through one setup (`at.ourproject.logging`, `logback.xml`): fields `@timestamp`, `log.level`,
+`log.logger`, `service.name`, `service.version`, `message`, `error.type`/`error.message`/`error.stack_trace`, and on the
+access line (`event.action=http.access`, one per request except `/healthz` and `/readyz`) `http.request.method`,
+`http.route`, `http.response.status_code`, `event.duration` (ns), `event.outcome`, `request.id` (`X-Request-Id`, echoed),
+`trace.id`/`span.id` (`traceparent`), `tenant.id`, `client.id` (the token's `azp`). No user, e-mail, user agent, address
+or query values.
 
 Exposed port: **8085** (HTTP/REST).
 

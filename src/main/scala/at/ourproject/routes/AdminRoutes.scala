@@ -6,15 +6,15 @@ import org.apache.pekko.http.scaladsl.model.StatusCodes
 import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import org.apache.pekko.http.scaladsl.server.directives.Credentials
-import org.apache.pekko.stream.{Materializer, SystemMaterializer}
 import org.apache.pekko.util.Timeout
 import at.ourproject.dao.Dao
+import at.ourproject.logging.AccessLog
 import at.ourproject.routes.UpdateClassEnum.UpdateClassEnum
 import at.ourproject.services.AdminService
 import com.github.pjfanning.pekkohttpcirce.FailFastCirceSupport._
 import io.circe.generic.auto._
 import io.circe.{Decoder, Encoder}
-import org.slf4j.Logger
+import org.slf4j.{Logger, LoggerFactory}
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -36,64 +36,70 @@ case class UpdateMessage(updateClass: UpdateClassEnum, tenant: String, participa
 class AdminRoutes(daos: Dao, akkaAuthenticator: Credentials => Future[Option[AuthenticatedUser]], admin: ActorRef[AdminService.Command]) (implicit val system: ActorSystem[_], val ex: ExecutionContext) extends Router {
   private implicit val timeout: Timeout = Timeout.create(system.settings.config.getDuration("app.routes.ask-timeout"))
   implicit val scheduler: Scheduler = system.scheduler
-  implicit val materializer: Materializer = SystemMaterializer(system).materializer
 
   import at.ourproject.json.JsonFormater._
 
-  val log: Logger = system.log
+  val log: Logger = LoggerFactory.getLogger(getClass)
+
+  // The row read back after the update; 404 when there is none.
+  private def found[T: Encoder](row: Future[Option[T]]): Route =
+    onSuccess(row) {
+      case Some(value) => complete(value)
+      case None => complete(StatusCodes.NotFound)
+    }
 
   private val adminRoutes = concat(
     pathPrefix("admin") {
-      authenticateOAuth2Async(realm = "keycloak", authenticator = akkaAuthenticator) { user: AuthenticatedUser =>
+      KeycloakJwtAuthenticator.authenticated(akkaAuthenticator) { user: AuthenticatedUser =>
         RoleDirectives.requireSuperuser(user) {
-        path("master" / "update") {
+        AccessLog.path("master", "update") {
           pathEndOrSingleSlash {
             post {
-              entity(as[UpdateMessage]) { updateMsg =>
+              AccessLog.withTenant(entity(as[UpdateMessage]))(_.tenant) { updateMsg =>
                 val processFuture: Future[AdminService.Command] = admin.ask(
                   ref => AdminService.MessageUpdate(updateMsg, ref)
                 )(timeout, scheduler).mapTo[AdminService.Command]
                 onSuccess(processFuture) {
                   case AdminService.MessageUpdateOk =>
-                    complete(daos.meteringRepository.getMeteringPoint(updateMsg.tenant, updateMsg.participantId.getOrElse(""), updateMsg.meteringPoint.getOrElse("")))
-                  case AdminService.MessageUpdateFail(_, e) =>
-                    log.error(e)
+                    found(daos.meteringRepository.getMeteringPoint(updateMsg.tenant, updateMsg.participantId.getOrElse(""), updateMsg.meteringPoint.getOrElse("")))
+                  case AdminService.MessageUpdateFail(_, reason, cause) =>
+                    log.error("Message Update Failed - {}", reason, cause.orNull)
                     complete(StatusCodes.BadRequest)
                 }
               }
             }
           }
         } ~
-        path("master" / "update" / "participant") {
+        AccessLog.path("master", "update", "participant") {
           pathEndOrSingleSlash {
             post {
-              entity(as[UpdateMessage]) { updateMsg =>
+              AccessLog.withTenant(entity(as[UpdateMessage]))(_.tenant) { updateMsg =>
                 val processFuture: Future[AdminService.Command] = admin.ask(
                   ref => AdminService.MessageUpdate(updateMsg, ref)
                 )(timeout, scheduler).mapTo[AdminService.Command]
                 onSuccess(processFuture) {
                   case AdminService.MessageUpdateOk =>
-                    complete(daos.participantRepository.getById(updateMsg.participantId.getOrElse("")))
-                  case AdminService.MessageUpdateFail(_, e) =>
-                    log.error(s"Message Update Failed - $e")
+                    found(daos.participantRepository.getById(updateMsg.participantId.getOrElse("")))
+                  case AdminService.MessageUpdateFail(_, reason, cause) =>
+                    log.error("Message Update Failed - {}", reason, cause.orNull)
                     complete(StatusCodes.BadRequest)
                 }
               }
             }
           }
         } ~
-        path("master" / "update" / "eeg") {
+        AccessLog.path("master", "update", "eeg") {
           pathEndOrSingleSlash {
             post {
-              entity(as[UpdateMessage]) { updateMsg =>
+              AccessLog.withTenant(entity(as[UpdateMessage]))(_.tenant) { updateMsg =>
                 val processFuture: Future[AdminService.Command] = admin.ask(
                   ref => AdminService.MessageUpdate(updateMsg, ref)
                 )(timeout, scheduler).mapTo[AdminService.Command]
                 onSuccess(processFuture) {
                   case AdminService.MessageUpdateOk =>
                     complete(daos.eegRepository.getByTenant(updateMsg.tenant))
-                  case AdminService.MessageUpdateFail(_, e) =>
-                    log.error(s"Message Update Failed - ${e}")
+                  case AdminService.MessageUpdateFail(_, reason, cause) =>
+                    log.error("Message Update Failed - {}", reason, cause.orNull)
                     complete(StatusCodes.BadRequest)
                 }
               }

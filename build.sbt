@@ -3,7 +3,10 @@ import com.typesafe.sbt.packager.docker.{Cmd, DockerChmodType, ExecCmd}
 
 ThisBuild / version := "0.2.10-SNAPSHOT"
 
-ThisBuild / scalaVersion := "2.13.9"
+ThisBuild / scalaVersion := "2.13.18"
+
+// Report deprecations in full (warnings only, the build does not fail on them).
+ThisBuild / scalacOptions += "-deprecation"
 
 val dockerVersion      = "0.2.11"
 
@@ -14,6 +17,14 @@ val ciRef = sys.env.getOrElse("GITHUB_REF", "")
 val isFeatureBranchBuild =
   ciRef.startsWith("refs/heads/preview/") || ciRef.startsWith("refs/heads/env/")
 
+// service.version in the logs: sha-<short> of the commit the image is built from (the git tag on a tag build), locally
+// dev. A release does not rebuild: promote-image.yml (eegfaktura-gitops) re-tags a verified dev-tier digest as vX.Y.Z,
+// so a released image keeps the sha-<short> of its build; the vX.Y.Z is not in the log. Not dockerVersion: that
+// label is not the release version (eegfaktura-dev tracking admin-backend 4).
+val serviceVersion =
+  if (ciRef.startsWith("refs/tags/")) ciRef.stripPrefix("refs/tags/")
+  else sys.env.get("GITHUB_SHA").filter(_.nonEmpty).map(sha => "sha-" + sha.take(7)).getOrElse("dev")
+
 lazy val root = (project in file("."))
   .enablePlugins(PekkoGrpcPlugin)
   .enablePlugins(JavaAppPackaging)
@@ -22,25 +33,33 @@ lazy val root = (project in file("."))
     name := "eegfaktura-registration",
     // Pekko ist auf Maven Central, kein Lightbend-Resolver mehr noetig
     libraryDependencies ++= Seq(
-        keycloakCore, keycloakAdminClient, keycloakAdapter,
-        sttpClient3,
-        /*slf4j,*/ scalaLogging, logback,
+        keycloakCore, keycloakAdminClient,
+        logback, julToSlf4j,
         akka, akkaStream, akkaHttp, pekkoSlf4j, pekkoDiscovery,
         circeCore, circeGeneric, circeParser, akkaHttpCirce,
-        slick, slickHikaricp, postgresLib, nimbusdsJwt
-    ),
+        slick, slickHikaricp, postgresLib, nimbusdsJwt,
+        protobufJava, jawnParser, commonsIo
+    ) ++ jacksonFamily ++ grpcFamily,
 
     libraryDependencies ++= Seq(
       scalaTest, streamTestkit, akkaTestkit,
     ).map(_ % Test),
 
+    // One forked JVM, suites one after another (as eda-xp): the log tests attach appenders to the one logback context
+    // and install the java.util.logging bridge, which must meet neither another suite nor sbt's own logging.
+    Test / fork := true,
+    Test / parallelExecution := false,
+
+    // Force exact versions (platform#183): they stop another dependency from pulling these families
+    // up past the declared versions, but they also silently DOWNGRADE when a future bump brings a
+    // newer one - raise JacksonVersion / GrpcVersion in Dependencies.scala together with such a bump.
+    // Removal plan for gRPC/protobuf: pekko-grpc plugin/runtime 1.2.0 (sbt 1.9+, given) brings grpc 1.75
+    // and protobuf 3.25.8 natively, then grpcFamily and protobufJava can go.
+    dependencyOverrides ++= jacksonFamily ++ grpcFamily :+ guava,
+
   )
 
 lazy val dockerSettings = Seq(
-//  Docker / packageName := "eegfaktura-admin-backend",
-//  Docker / maintainer := "vfeeg <vfeeg.org>",
-//  Docker / version := appVersion,
-
   dockerBaseImage := "eclipse-temurin:17-jre",
   dockerRepository := Some("ghcr.io"),
   dockerUsername := Some("gemeinstrom"),
@@ -54,8 +73,9 @@ lazy val dockerSettings = Seq(
     case cmd => false
   },
   dockerCommands ++= Seq(
-    //    Cmd("ADD", "application-app.conf", "/conf/application.conf"),
     Cmd("LABEL", s"""version="${dockerVersion}""""),
+    // logging (at.ourproject.logging.LogSettings): JSON lines in the image, the image version as service.version
+    Cmd("ENV", "LOG_FORMAT=json", s"SERVICE_VERSION=${serviceVersion}"),
     ExecCmd("CMD", "/opt/docker/bin/eegfaktura-registration", "-Dconfig.file=/conf/application.conf")
   ),
   dockerChmodType := DockerChmodType.UserGroupWriteExecute,
